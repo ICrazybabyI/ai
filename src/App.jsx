@@ -10,7 +10,7 @@ const WS_URL = window.location.protocol === 'https:' ? `wss://${window.location.
 
 function App() {
   const [isDarkMode, setIsDarkMode] = useState(() => {
-    return localStorage.getItem('darkMode') === 'true' || 
+    return localStorage.getItem('darkMode') === 'true' ||
            window.matchMedia('(prefers-color-scheme: dark)').matches;
   });
   const [ws, setWs] = useState(null);
@@ -19,13 +19,33 @@ function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
   const [conversations, setConversations] = useState([]);
-  const [currentConversationId, setCurrentConversationId] = useState(() => {
-    return localStorage.getItem('currentConversationId') || '';
-  });
+  // currentConversationId is the active conversation id shown in UI
+  const [currentConversationId, setCurrentConversationId] = useState('');
+  // currentHelper: 'cisco' | 'network'
   const [currentHelper, setCurrentHelper] = useState(() => {
     return localStorage.getItem('currentHelper') || 'cisco';
   });
+
+  // Map of helper -> conversationId, persisted in localStorage
+  const [conversationMap, setConversationMap] = useState(() => {
+    try {
+      const raw = localStorage.getItem('conversationMap');
+      if (raw) return JSON.parse(raw);
+    } catch (e) { /* ignore */ }
+    return { cisco: '', network: '' };
+  });
+
+  // pending helper for which we requested create_conversation but haven't received conversation_created yet
+  const pendingConversationCreateHelperRef = useRef(null);
+
+  const messagesContainerRef = useRef(null);
   const messagesEndRef = useRef(null);
+  const autoScrollRef = useRef(true);
+  const lastAutoScrollAtRef = useRef(0);
+  const scrollThrottleMs = 80;
+  const autoScrollThresholdPx = 150;
+  const [isUserAtBottom, setIsUserAtBottom] = useState(true);
+
   // Generate a compatible UUID
   const generateUUID = () => {
     return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -38,103 +58,107 @@ function App() {
   // Ensure userId is always a valid UUID
   const getValidUserId = () => {
     const storedUserId = localStorage.getItem('userId');
-    // Validate if stored userId is a valid UUID (36 characters)
     if (storedUserId && storedUserId.length === 36) {
       return storedUserId;
     }
-    // Generate a new valid UUID if stored one is invalid
     const newUserId = generateUUID();
     localStorage.setItem('userId', newUserId);
     return newUserId;
   };
 
-  // Initialize userIdRef with a valid UUID string
   const userIdRef = useRef(getValidUserId());
 
-  // Save userId to localStorage
+  // Persist conversationMap and currentHelper changes
   useEffect(() => {
-    localStorage.setItem('userId', userIdRef.current);
-  }, []);
+    localStorage.setItem('conversationMap', JSON.stringify(conversationMap));
+  }, [conversationMap]);
 
-  // Set dark mode
-  useEffect(() => {
-    localStorage.setItem('darkMode', isDarkMode);
-    document.documentElement.classList.toggle('dark', isDarkMode);
-  }, [isDarkMode]);
-  
-  // Save current helper to localStorage
   useEffect(() => {
     localStorage.setItem('currentHelper', currentHelper);
   }, [currentHelper]);
 
+  // initialize currentConversationId from conversationMap for the starting helper
+  useEffect(() => {
+    const mappedId = conversationMap[currentHelper];
+    if (mappedId) {
+      setCurrentConversationId(mappedId);
+    } else {
+      setCurrentConversationId(''); // no mapped conversation yet
+    }
+  }, []); // run once on mount
+
+  // Save userId to localStorage (just ensure)
+  useEffect(() => {
+    localStorage.setItem('userId', userIdRef.current);
+  }, []);
+
+  // Set dark mode class on html root
+  useEffect(() => {
+    localStorage.setItem('darkMode', isDarkMode);
+    document.documentElement.classList.toggle('dark', isDarkMode);
+  }, [isDarkMode]);
+
   // WebSocket connection with retry mechanism
   useEffect(() => {
-    let ws = null;
+    let wsInstance = null;
     let reconnectAttempts = 0;
     const maxReconnectAttempts = 5;
     const reconnectDelay = 2000; // 2 seconds
     let reconnectTimeoutId = null;
 
-    // Connect to WebSocket
     const connect = () => {
       console.log(`Attempting to connect to WebSocket server at ${WS_URL}`);
-      ws = new WebSocket(WS_URL);
-      console.log('WebSocket instance created:', ws);
+      wsInstance = new WebSocket(WS_URL);
+      console.log('WebSocket instance created:', wsInstance);
 
-      ws.onopen = () => {
+      wsInstance.onopen = () => {
         console.log('WebSocket connected successfully!');
+        setWs(wsInstance);
         setIsConnected(true);
-        reconnectAttempts = 0; // Reset reconnect attempts on successful connection
-        
-        // Get conversations
-        console.log('Sending get_conversations request');
-        ws.send(JSON.stringify({
+        reconnectAttempts = 0;
+
+        // Request conversations list
+        wsInstance.send(JSON.stringify({
           type: 'get_conversations',
           userId: userIdRef.current
         }));
-        
-        // Get messages for current conversation
-        if (currentConversationId) {
-          console.log('Sending get_messages request for conversation:', currentConversationId);
-          ws.send(JSON.stringify({
+
+        // If we have an active conversation id for current helper, request its messages
+        if (conversationMap[currentHelper]) {
+          wsInstance.send(JSON.stringify({
+            type: 'get_messages',
+            conversationId: conversationMap[currentHelper]
+          }));
+        } else if (currentConversationId) {
+          // fallback if currentConversationId set
+          wsInstance.send(JSON.stringify({
             type: 'get_messages',
             conversationId: currentConversationId
           }));
         }
       };
 
-      ws.onmessage = (event) => {
-        console.log('WebSocket message received:', event);
+      wsInstance.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
-          console.log('WebSocket message parsed:', data);
-
           switch (data.type) {
             case 'welcome':
-              console.log('Welcome message from server:', data.message);
+              console.log('Welcome:', data.message);
               break;
             case 'message':
               setMessages(prev => {
-                // Check if message already exists to avoid duplicates
                 const messageExists = prev.some(m => m.id === data.id);
-                if (messageExists) {
-                  return prev;
-                }
-                
-                // Check if there's a temporary user message with the same content
-                // This happens because of optimistic UI update
-                const tempMessageIndex = prev.findIndex(m => 
-                  m.role === 'user' && 
-                  m.content === data.content && 
+                if (messageExists) return prev;
+                // optimistic replacement logic
+                const tempMessageIndex = prev.findIndex(m =>
+                  m.role === 'user' &&
+                  m.content === data.content &&
                   m.isStreaming === false &&
-                  // Check if it's a recent message (within 5 seconds)
                   Math.abs(new Date(m.createdAt) - new Date(data.createdAt)) < 5000
                 );
-                
                 if (tempMessageIndex >= 0) {
-                  // Replace temporary message with server-generated one
-                  const updatedMessages = [...prev];
-                  updatedMessages[tempMessageIndex] = {
+                  const updated = [...prev];
+                  updated[tempMessageIndex] = {
                     id: data.id,
                     conversationId: data.conversationId,
                     role: data.role,
@@ -143,10 +167,8 @@ function App() {
                     createdAt: new Date(data.createdAt),
                     isStreaming: false
                   };
-                  return updatedMessages;
+                  return updated;
                 }
-                
-                // If no temporary message found, add as new message
                 return [...prev, {
                   id: data.id,
                   conversationId: data.conversationId,
@@ -157,30 +179,26 @@ function App() {
                 }];
               });
               break;
-            
+
             case 'streaming_message':
               setMessages(prev => {
-                const existingMessageIndex = prev.findIndex(m => m.id === data.id);
-                if (existingMessageIndex >= 0) {
-                  const updatedMessages = [...prev];
-                  updatedMessages[existingMessageIndex] = {
-                    ...updatedMessages[existingMessageIndex],
+                const idx = prev.findIndex(m => m.id === data.id);
+                if (idx >= 0) {
+                  const updated = [...prev];
+                  updated[idx] = {
+                    ...updated[idx],
                     content: data.content,
                     thinks: data.thinks || [],
                     isStreaming: data.isStreaming
                   };
-                  return updatedMessages;
+                  return updated;
                 } else {
-                  // Check if this is a duplicate message by content
-                  const isDuplicate = prev.some(m => 
-                    m.content === data.content && 
-                    m.role === data.role && 
+                  const duplicate = prev.some(m =>
+                    m.content === data.content &&
+                    m.role === data.role &&
                     m.conversationId === data.conversationId
                   );
-                  if (isDuplicate) {
-                    console.log('Skipping duplicate message:', data.id);
-                    return prev;
-                  }
+                  if (duplicate) return prev;
                   return [...prev, {
                     id: data.id,
                     conversationId: data.conversationId,
@@ -189,17 +207,17 @@ function App() {
                     thinks: data.thinks || [],
                     isStreaming: data.isStreaming,
                     createdAt: new Date(data.createdAt),
-                    showThinks: false // Add showThinks state to control visibility
+                    showThinks: false
                   }];
                 }
               });
               setIsTyping(data.isStreaming);
               break;
-            
+
             case 'conversations':
               setConversations(data.conversations);
               break;
-            
+
             case 'messages':
               setMessages(data.messages.map(msg => ({
                 id: msg.id,
@@ -213,78 +231,141 @@ function App() {
                 showThinks: false
               })));
               break;
-            
+
             case 'conversation_created':
-              setCurrentConversationId(data.conversationId);
-              localStorage.setItem('currentConversationId', data.conversationId);
-              setMessages([]);
+              {
+                const newConversationId = data.conversationId;
+                // assign to pending helper if exists, otherwise assign to currentHelper
+                const helperToAssign = pendingConversationCreateHelperRef.current || currentHelper;
+
+                setConversationMap(prev => {
+                  const updated = { ...prev, [helperToAssign]: newConversationId };
+                  localStorage.setItem('conversationMap', JSON.stringify(updated));
+                  return updated;
+                });
+
+                setCurrentConversationId(newConversationId);
+                localStorage.setItem('currentConversationId', newConversationId);
+
+                // Clear pending helper
+                pendingConversationCreateHelperRef.current = null;
+
+                // clear messages in UI for new conversation
+                setMessages([]);
+              }
               break;
-            
+
             case 'error':
-              console.error('WebSocket error message:', data.error);
+              console.error('Server error:', data.error || data.message || data.details);
               break;
+
+            default:
+              console.log('Unknown message type:', data.type);
           }
-        } catch (error) {
-          console.error('Error parsing WebSocket message:', error);
-          console.error('Raw message:', event.data);
+        } catch (err) {
+          console.error('Error parsing WS message:', err, event.data);
         }
       };
 
-      ws.onclose = (event) => {
+      wsInstance.onclose = (event) => {
         console.error('WebSocket disconnected:', event);
-        console.error('Close code:', event.code);
-        console.error('Close reason:', event.reason);
-        console.error('Was clean close:', event.wasClean);
         setIsConnected(false);
-        
-        // Attempt to reconnect if we haven't reached max attempts
         if (reconnectAttempts < maxReconnectAttempts) {
           reconnectAttempts++;
-          console.log(`Attempting to reconnect (${reconnectAttempts}/${maxReconnectAttempts})...`);
           reconnectTimeoutId = setTimeout(connect, reconnectDelay);
         } else {
-          console.error('Max reconnect attempts reached. Please refresh the page to reconnect.');
+          console.error('Max reconnect attempts reached.');
         }
       };
 
-      ws.onerror = (error) => {
-        console.error('WebSocket error event:', error);
-        console.error('Error type:', error.type);
-        console.error('Error target:', error.target);
-        // Don't close connection on error, let onclose handle reconnect
+      wsInstance.onerror = (error) => {
+        console.error('WebSocket error:', error);
       };
-
-      setWs(ws);
     };
 
-    // Initial connection
     connect();
 
-    // Cleanup function
     return () => {
-      if (reconnectTimeoutId) {
-        clearTimeout(reconnectTimeoutId);
-      }
-      if (ws) {
-        console.log('Closing WebSocket connection in cleanup');
-        ws.close();
-      }
+      if (reconnectTimeoutId) clearTimeout(reconnectTimeoutId);
+      if (wsInstance) wsInstance.close();
+    };
+    // intentionally run once
+  }, []);
+
+  // If currentConversationId changes after websocket connected, fetch messages
+  useEffect(() => {
+    if (ws && isConnected && currentConversationId) {
+      ws.send(JSON.stringify({
+        type: 'get_messages',
+        conversationId: currentConversationId
+      }));
+    }
+  }, [currentConversationId, ws, isConnected]);
+
+  // Scroll listener: track whether user is near bottom and update state/ref
+  useEffect(() => {
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    let rafId = null;
+    const onScroll = () => {
+      if (rafId) cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(() => {
+        const atBottom = (el.scrollHeight - el.scrollTop - el.clientHeight) <= autoScrollThresholdPx;
+        autoScrollRef.current = atBottom;
+        setIsUserAtBottom(atBottom);
+      });
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    onScroll();
+    return () => {
+      el.removeEventListener('scroll', onScroll);
+      if (rafId) cancelAnimationFrame(rafId);
     };
   }, []);
 
-  // Scroll to bottom whenever messages change, including when sending new messages
+    const scrollToBottom = useCallback(() => {
+      const el = messagesContainerRef.current;
+      if (!el) return;
+      el.scrollTop = el.scrollHeight;
+  }, []);
+
+  // Auto-scroll effect: run on messages / typing
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+    const el = messagesContainerRef.current;
+    if (!el) return;
+    if (!autoScrollRef.current) return;
+
+    const lastMsg = messages[messages.length - 1];
+    const streamingNow = isTyping || (lastMsg && lastMsg.isStreaming);
+
+    const now = Date.now();
+    if (streamingNow) {
+      if (now - lastAutoScrollAtRef.current > scrollThrottleMs) {
+        lastAutoScrollAtRef.current = now;
+        scrollToBottom('auto');
+      }
+    } else {
+      scrollToBottom('smooth');
+    }
+  }, [messages, isTyping, scrollToBottom]);
+
+  // When conversation changes / messages reset, enable auto-scroll
+  useEffect(() => {
+    autoScrollRef.current = true;
+    setIsUserAtBottom(true);
+    scrollToBottom('auto');
+  }, [currentConversationId, scrollToBottom]);
 
   // Send message to WebSocket
   const sendMessage = useCallback(() => {
     if (!inputMessage.trim() || !ws || !isConnected) return;
 
-    // Create a temporary message object for the user's message
+    // determine conversation id to use (mapped for current helper if present)
+    const convoIdToUse = conversationMap[currentHelper] || currentConversationId || '';
+
     const userMessage = {
       id: generateUUID(),
-      conversationId: currentConversationId,
+      conversationId: convoIdToUse,
       role: 'user',
       content: inputMessage,
       helper: currentHelper,
@@ -292,26 +373,21 @@ function App() {
       isStreaming: false
     };
 
-    // Add the message to local state immediately for better UX
+    // optimistic add
     setMessages(prev => [...prev, userMessage]);
 
     ws.send(JSON.stringify({
       type: 'new_message',
-      conversationId: currentConversationId,
+      conversationId: convoIdToUse,
       message: inputMessage,
       userId: userIdRef.current,
       helper: currentHelper
     }));
 
     setInputMessage('');
-  }, [inputMessage, ws, isConnected, currentConversationId, currentHelper]);
+  }, [inputMessage, ws, isConnected, currentConversationId, conversationMap, currentHelper]);
 
-  // Handle input change
-  const handleInputChange = (e) => {
-    setInputMessage(e.target.value);
-  };
-
-  // Handle key press (Enter to send, Shift+Enter for new line)
+  const handleInputChange = (e) => setInputMessage(e.target.value);
   const handleKeyPress = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -319,12 +395,17 @@ function App() {
     }
   };
 
-  // Handle conversation change
+  // When user selects a conversation from sidebar, we should bind it to the active helper
   const handleConversationChange = (conversationId) => {
     setCurrentConversationId(conversationId);
+    // bind to current helper
+    setConversationMap(prev => {
+      const updated = { ...prev, [currentHelper]: conversationId };
+      localStorage.setItem('conversationMap', JSON.stringify(updated));
+      return updated;
+    });
     localStorage.setItem('currentConversationId', conversationId);
     setMessages([]);
-    
     if (ws && isConnected) {
       ws.send(JSON.stringify({
         type: 'get_messages',
@@ -333,13 +414,15 @@ function App() {
     }
   };
 
-  // Create new conversation
+  // Create new conversation for current helper
   const createNewConversation = () => {
     if (ws && isConnected) {
+      // mark pending helper
+      pendingConversationCreateHelperRef.current = currentHelper;
       ws.send(JSON.stringify({
         type: 'create_conversation',
         userId: userIdRef.current,
-        title: `New Conversation ${new Date().toLocaleString()}`
+        title: `New Conversation (${currentHelper}) ${new Date().toLocaleString()}`
       }));
     }
   };
@@ -349,10 +432,8 @@ function App() {
     setIsDarkMode(!isDarkMode);
   };
 
-  // State for delete confirmation
   const [deleteConfirm, setDeleteConfirm] = useState(null);
 
-  // Delete conversation
   const deleteConversation = (conversationId) => {
     if (ws && isConnected) {
       ws.send(JSON.stringify({
@@ -361,14 +442,70 @@ function App() {
         userId: userIdRef.current
       }));
       setDeleteConfirm(null);
-      
+
       // If deleting current conversation, clear currentConversationId
-      // The new conversation will be created if needed in the WebSocket message handler
       if (conversationId === currentConversationId) {
         setCurrentConversationId('');
         setMessages([]);
       }
+
+      // Remove mapping entries that reference this conversationId
+      setConversationMap(prev => {
+        const updated = { ...prev };
+        Object.keys(updated).forEach(k => {
+          if (updated[k] === conversationId) updated[k] = '';
+        });
+        localStorage.setItem('conversationMap', JSON.stringify(updated));
+        return updated;
+      });
     }
+  };
+
+  // Switching helper: reuse mapped conversationId if exists, otherwise create new conversation
+  const switchHelper = (newHelper) => {
+    // update UI helper immediately
+    setCurrentHelper(newHelper);
+
+    const mapped = conversationMap[newHelper];
+    if (mapped) {
+      // use existing conversation id for that helper
+      setCurrentConversationId(mapped);
+      localStorage.setItem('currentConversationId', mapped);
+      setMessages([]);
+      if (ws && isConnected) {
+        ws.send(JSON.stringify({
+          type: 'get_messages',
+          conversationId: mapped
+        }));
+      }
+    } else {
+      // No mapped conversation: request create_conversation for this helper
+      pendingConversationCreateHelperRef.current = newHelper;
+      if (ws && isConnected) {
+        ws.send(JSON.stringify({
+          type: 'create_conversation',
+          userId: userIdRef.current,
+          title: `New Conversation (${newHelper}) ${new Date().toLocaleString()}`
+        }));
+      } else {
+        // if no ws, just clear currentConversationId
+        setCurrentConversationId('');
+        setMessages([]);
+      }
+    }
+  };
+
+  // Unified Markdown component (GFM only)
+  const Markdown = ({ children }) => (
+    <ReactMarkdown remarkPlugins={[remarkGfm]}>
+      {children}
+    </ReactMarkdown>
+  );
+
+  const handleScrollToBottomClick = () => {
+    autoScrollRef.current = true;
+    setIsUserAtBottom(true);
+    scrollToBottom('smooth');
   };
 
   return (
@@ -380,7 +517,7 @@ function App() {
               <div className="helper-card front cisco-card">
                 <button 
                   className="helper-toggle-btn"
-                  onClick={() => setCurrentHelper('network')}
+                  onClick={() => switchHelper('network')}
                   title="切换到网络知识助手"
                 >
                   思科配置助手
@@ -389,7 +526,7 @@ function App() {
               <div className="helper-card back network-card">
                 <button 
                   className="helper-toggle-btn"
-                  onClick={() => setCurrentHelper('cisco')}
+                  onClick={() => switchHelper('cisco')}
                   title="切换到思科配置助手"
                 >
                   网络知识助手
@@ -480,7 +617,19 @@ function App() {
           {currentConversationId ? (
             <>
               {/* Messages */}
-              <div className="messages-container">
+              <div className="messages-container" ref={messagesContainerRef}>
+
+                {/* "回到底部" 按钮（当用户非底部时显示） */}
+                {!isUserAtBottom && (
+                  <button
+                    className="scroll-to-bottom"
+                    onClick={handleScrollToBottomClick}
+                    title="Scroll to bottom"
+                  >
+                    ⤓ 回到底部
+                  </button>
+                )}
+
                 {messages.length === 0 && !isTyping ? (
                   <div className="empty-state">
                     <img 
@@ -529,22 +678,21 @@ function App() {
                             <div 
                               className={`message-think ${message.showThinks ? 'open' : ''}`}
                               ref={(el) => {
-                                // Auto-scroll when thinking is expanded and message is streaming
-                                if (el && message.showThinks && message.isStreaming) {
+                                if (el && message.showThinks && message.isStreaming && autoScrollRef.current) {
                                   el.scrollTop = el.scrollHeight;
                                 }
                               }}
                             >
                               {message.thinks.map((think, index) => (
                                 <div key={index} className="think-item">
-                                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{think}</ReactMarkdown>
+                                  <Markdown>{think}</Markdown>
                                 </div>
                               ))}
                             </div>
                           </div>
                         )}
                         <div className="message-content">
-                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                          <Markdown>{message.content}</Markdown>
                           {message.isStreaming && <span className="typing-indicator">...</span>}
                         </div>
                         <div className="message-time">

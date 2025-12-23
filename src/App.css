@@ -42,6 +42,9 @@ body {
   --input-text: #333333;
   --sidebar-bg: #f5f5f5;
   --conversation-active-bg: #e0e0e0;
+  --button-bg-dark: #0056b3;
+  --button-text-dark: #ffffff;
+  --border-color-dark: #333333;
 }
 
 .dark {
@@ -63,6 +66,9 @@ body {
   --input-text: #ffffff;
   --sidebar-bg: #2d2d2d;
   --conversation-active-bg: #404040;
+  --button-bg-dark: #003a75;
+  --button-text-dark: #ffffff;
+  --border-color-dark: #2b2b2b;
 }
 
 /* App container */
@@ -394,7 +400,9 @@ body {
   font-size: 1rem;
   line-height: 1.5;
   word-wrap: break-word;
-  white-space: pre-wrap;
+  white-space: normal;
+  /* allow horizontal scroll for long code blocks/tables inside */
+  overflow-x: auto;
 }
 
 .message-helper {
@@ -410,6 +418,55 @@ body {
 
 .dark .message-helper {
   background-color: var(--bg-tertiary);
+}
+
+/* Inline code */
+.message-content code {
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 0.9em;
+  display: inline; /* changed from inline-block to inline to avoid layout shifts */
+}
+
+/* Block code */
+.message-content pre {
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  padding: 1rem;
+  border-radius: 8px;
+  overflow-x: auto; /* allow horizontal scroll for long lines */
+  font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
+  font-size: 0.9em;
+  line-height: 1.4;
+  margin: 1rem 0;
+  white-space: pre; /* preserve all spacing and line breaks */
+}
+
+/* Ensure code inside pre is block-level */
+.message-content pre code {
+  background-color: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: 1em;
+  display: block;
+}
+
+.dark .message-content code {
+  background-color: rgba(255, 255, 255, 0.1);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+
+.dark .message-content pre {
+  background-color: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.dark .message-content pre code {
+  background-color: transparent;
+  border: none;
 }
 
 /* Floating helper toggle button with simple flip animation */
@@ -740,7 +797,7 @@ body {
   border-radius: 4px;
   font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', monospace;
   font-size: 0.9em;
-  display: inline-block;
+  display: inline;
 }
 
 .message-content pre {
@@ -753,8 +810,7 @@ body {
   font-size: 0.9em;
   line-height: 1.4;
   margin: 1rem 0;
-  white-space: pre-wrap;
-  word-wrap: break-word;
+  white-space: pre;
 }
 
 .message-content pre code {
@@ -864,12 +920,18 @@ body {
 }
 
 /* Table styles */
+.message-content .table-wrapper {
+  width: 100%;
+  overflow-x: auto;
+}
+
 .message-content table {
   width: 100%;
   border-collapse: collapse;
   margin: 1rem 0;
   overflow-x: auto;
   display: block;
+  min-width: 480px; /* allow table to overflow horizontally on small screens */
 }
 
 .message-content th,
@@ -900,4 +962,42 @@ body {
 
 .dark .message-content tr:nth-child(even) td {
   background-color: var(--bg-tertiary);
+}
+/* 确保 messages-container 相对定位，以便放置回到底部按钮 */
+.messages-container {
+  position: relative; /* 新增或确保为 relative */
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  background-color: var(--bg-primary);
+}
+
+/* 回到底部按钮 */
+.scroll-to-bottom {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  z-index: 50;
+  background-color: var(--button-bg);
+  color: var(--button-text);
+  border: none;
+  padding: 0.45rem 0.75rem;
+  border-radius: 20px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 6px 12px rgba(0,0,0,0.12);
+  transition: transform 0.15s ease, opacity 0.15s ease;
+}
+
+.scroll-to-bottom:hover {
+  transform: translateY(-3px);
+}
+
+/* 在深色模式下调整按钮颜色 */
+.dark .scroll-to-bottom {
+  background-color: var(--button-bg);
+  color: var(--button-text);
 }
