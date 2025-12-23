@@ -83,10 +83,18 @@ async function initializeDatabase() {
         conversation_id VARCHAR(36) NOT NULL,
         role ENUM('user', 'assistant') NOT NULL,
         content TEXT NOT NULL,
+        helper VARCHAR(50) DEFAULT 'cisco' NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
       )
     `);
+    
+    // Add helper column if it doesn't exist (for existing tables)
+    try {
+      await connection.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS helper VARCHAR(50) DEFAULT 'cisco' NOT NULL`);
+    } catch (error) {
+      console.log('Helper column already exists, skipping:', error.message);
+    }
     
     connection.release();
     databaseAvailable = true;
@@ -144,8 +152,8 @@ async function mockAIResponse(ws, conversationId, message) {
   // Save full response to database
   if (databaseAvailable && pool) {
     await pool.query(
-      'INSERT INTO messages (id, conversation_id, role, content) VALUES (?, ?, ?, ?)',
-      [assistantMessageId, conversationId, 'assistant', responseText]
+      'INSERT INTO messages (id, conversation_id, role, content, helper) VALUES (?, ?, ?, ?, ?)',
+      [assistantMessageId, conversationId, 'assistant', responseText, 'cisco']
     );
   }
 }

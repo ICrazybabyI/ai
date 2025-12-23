@@ -1,6 +1,9 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import './App.css';
+import aiAvatar from '../ai-avatar.png';
+import aiAvatarWhite from '../ai-avatar_white.png';
 
 // Use relative WebSocket URL with same port as HTTP server to avoid CORS issues
 const WS_URL = window.location.protocol === 'https:' ? `wss://${window.location.host}` : `ws://${window.location.host}`;
@@ -18,6 +21,9 @@ function App() {
   const [conversations, setConversations] = useState([]);
   const [currentConversationId, setCurrentConversationId] = useState(() => {
     return localStorage.getItem('currentConversationId') || '';
+  });
+  const [currentHelper, setCurrentHelper] = useState(() => {
+    return localStorage.getItem('currentHelper') || 'cisco';
   });
   const messagesEndRef = useRef(null);
   // Generate a compatible UUID
@@ -55,6 +61,11 @@ function App() {
     localStorage.setItem('darkMode', isDarkMode);
     document.documentElement.classList.toggle('dark', isDarkMode);
   }, [isDarkMode]);
+  
+  // Save current helper to localStorage
+  useEffect(() => {
+    localStorage.setItem('currentHelper', currentHelper);
+  }, [currentHelper]);
 
   // WebSocket connection with retry mechanism
   useEffect(() => {
@@ -103,13 +114,48 @@ function App() {
               console.log('Welcome message from server:', data.message);
               break;
             case 'message':
-              setMessages(prev => [...prev, {
-                id: data.id,
-                conversationId: data.conversationId,
-                role: data.role,
-                content: data.content,
-                createdAt: new Date(data.createdAt)
-              }]);
+              setMessages(prev => {
+                // Check if message already exists to avoid duplicates
+                const messageExists = prev.some(m => m.id === data.id);
+                if (messageExists) {
+                  return prev;
+                }
+                
+                // Check if there's a temporary user message with the same content
+                // This happens because of optimistic UI update
+                const tempMessageIndex = prev.findIndex(m => 
+                  m.role === 'user' && 
+                  m.content === data.content && 
+                  m.isStreaming === false &&
+                  // Check if it's a recent message (within 5 seconds)
+                  Math.abs(new Date(m.createdAt) - new Date(data.createdAt)) < 5000
+                );
+                
+                if (tempMessageIndex >= 0) {
+                  // Replace temporary message with server-generated one
+                  const updatedMessages = [...prev];
+                  updatedMessages[tempMessageIndex] = {
+                    id: data.id,
+                    conversationId: data.conversationId,
+                    role: data.role,
+                    content: data.content,
+                    helper: data.helper || currentHelper,
+                    createdAt: new Date(data.createdAt),
+                    isStreaming: false
+                  };
+                  return updatedMessages;
+                }
+                
+                // If no temporary message found, add as new message
+                return [...prev, {
+                  id: data.id,
+                  conversationId: data.conversationId,
+                  role: data.role,
+                  content: data.content,
+                  helper: data.helper || currentHelper,
+                  createdAt: new Date(data.createdAt)
+                }];
+              });
               break;
             
             case 'streaming_message':
@@ -160,7 +206,11 @@ function App() {
                 conversationId: msg.conversationId,
                 role: msg.role,
                 content: msg.content,
-                createdAt: new Date(msg.created_at)
+                helper: msg.helper,
+                thinks: msg.thinks || [],
+                isStreaming: false,
+                createdAt: new Date(msg.createdAt),
+                showThinks: false
               })));
               break;
             
@@ -222,7 +272,7 @@ function App() {
     };
   }, []);
 
-  // Scroll to bottom when messages change
+  // Scroll to bottom whenever messages change, including when sending new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
@@ -231,15 +281,30 @@ function App() {
   const sendMessage = useCallback(() => {
     if (!inputMessage.trim() || !ws || !isConnected) return;
 
+    // Create a temporary message object for the user's message
+    const userMessage = {
+      id: generateUUID(),
+      conversationId: currentConversationId,
+      role: 'user',
+      content: inputMessage,
+      helper: currentHelper,
+      createdAt: new Date(),
+      isStreaming: false
+    };
+
+    // Add the message to local state immediately for better UX
+    setMessages(prev => [...prev, userMessage]);
+
     ws.send(JSON.stringify({
       type: 'new_message',
       conversationId: currentConversationId,
       message: inputMessage,
-      userId: userIdRef.current
+      userId: userIdRef.current,
+      helper: currentHelper
     }));
 
     setInputMessage('');
-  }, [inputMessage, ws, isConnected, currentConversationId]);
+  }, [inputMessage, ws, isConnected, currentConversationId, currentHelper]);
 
   // Handle input change
   const handleInputChange = (e) => {
@@ -284,9 +349,55 @@ function App() {
     setIsDarkMode(!isDarkMode);
   };
 
+  // State for delete confirmation
+  const [deleteConfirm, setDeleteConfirm] = useState(null);
+
+  // Delete conversation
+  const deleteConversation = (conversationId) => {
+    if (ws && isConnected) {
+      ws.send(JSON.stringify({
+        type: 'delete_conversation',
+        conversationId: conversationId,
+        userId: userIdRef.current
+      }));
+      setDeleteConfirm(null);
+      
+      // If deleting current conversation, clear currentConversationId
+      // The new conversation will be created if needed in the WebSocket message handler
+      if (conversationId === currentConversationId) {
+        setCurrentConversationId('');
+        setMessages([]);
+      }
+    }
+  };
+
   return (
     <div className={`app ${isDarkMode ? 'dark' : ''}`}>
       <div className="app-container">
+          {/* Floating helper toggle button with simple flip animation */}
+          <div className="floating-helper-toggle">
+            <div className={`helper-toggle-container ${currentHelper === 'network' ? 'flipped' : ''}`}>
+              <div className="helper-card front cisco-card">
+                <button 
+                  className="helper-toggle-btn"
+                  onClick={() => setCurrentHelper('network')}
+                  title="切换到网络知识助手"
+                >
+                  思科配置助手
+                </button>
+              </div>
+              <div className="helper-card back network-card">
+                <button 
+                  className="helper-toggle-btn"
+                  onClick={() => setCurrentHelper('cisco')}
+                  title="切换到思科配置助手"
+                >
+                  网络知识助手
+                </button>
+              </div>
+            </div>
+          </div>
+        
         {/* Sidebar */}
         <div className="sidebar">
           <div className="sidebar-header">
@@ -321,6 +432,43 @@ function App() {
                 </div>
                 <div className="conversation-date">
                   {new Date(conversation.updated_at).toLocaleString()}
+                  <div className="conversation-delete-container">
+                    {deleteConfirm === conversation.id ? (
+                      <>
+                        <button 
+                          className="delete-cancel-btn"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setDeleteConfirm(null);
+                          }}
+                          title="Cancel Delete"
+                        >
+                          ⤸
+                        </button>
+                        <button 
+                          className="delete-confirm-btn"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteConversation(conversation.id);
+                          }}
+                          title="Confirm Delete"
+                        >
+                          ✕
+                        </button>
+                      </>
+                    ) : (
+                      <button 
+                        className="delete-btn"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDeleteConfirm(conversation.id);
+                        }}
+                        title="Delete Conversation"
+                      >
+                        ✕
+                      </button>
+                    )}
+                  </div>
                 </div>
               </div>
             ))}
@@ -333,67 +481,89 @@ function App() {
             <>
               {/* Messages */}
               <div className="messages-container">
-                {messages.map((message) => (
-                  <div
-                    key={message.id}
-                    className={`message ${message.role === 'assistant' ? 'assistant' : 'user'}`}
-                  >
-                    {/* Think section with toggle for assistant messages */}
-                    {message.role === 'assistant' && message.thinks && message.thinks.length > 0 && (
-                      <div className="message-think-container">
-                        <button 
-                          className="think-toggle-btn"
-                          onClick={() => {
-                            setMessages(prev => {
-                              const updatedMessages = [...prev];
-                              const msgIndex = updatedMessages.findIndex(m => m.id === message.id);
-                              if (msgIndex >= 0) {
-                                updatedMessages[msgIndex] = {
-                                  ...updatedMessages[msgIndex],
-                                  showThinks: !updatedMessages[msgIndex].showThinks
-                                };
-                              }
-                              return updatedMessages;
-                            });
-                          }}
-                          title={message.showThinks ? 'Hide thinking process' : 'Show thinking process'}
-                        >
-                          {message.showThinks ? '▼' : '▶'}
-                        </button>
-                        {message.showThinks && (
-                          <div className="message-think">
-                            {message.thinks.map((think, index) => (
-                              <div key={index} className="think-item">
-                                <ReactMarkdown>{think}</ReactMarkdown>
-                              </div>
-                            ))}
+                {messages.length === 0 && !isTyping ? (
+                  <div className="empty-state">
+                    <img 
+                      src={isDarkMode ? aiAvatarWhite : aiAvatar} 
+                      alt="AI Assistant" 
+                      className="empty-state-image"
+                    />
+                    <p className="empty-state-text">我是AI小助手,请输入您的问题!</p>
+                  </div>
+                ) : (
+                  <>
+                    {messages.map((message) => (
+                      <div
+                        key={message.id}
+                        className={`message ${message.role === 'assistant' ? 'assistant' : 'user'}`}
+                      >
+                        {/* Helper indicator above the message */}
+                        {message.helper && (
+                          <div className="message-helper">
+                            {message.helper === 'cisco' ? '思科配置助手' : '网络知识助手'}
                           </div>
                         )}
+                        
+                        {/* Think section with toggle for assistant messages */}
+                        {message.role === 'assistant' && message.thinks && message.thinks.length > 0 && (
+                          <div className="message-think-container">
+                            <button 
+                              className="think-toggle-btn"
+                              onClick={() => {
+                                setMessages(prev => {
+                                  const updatedMessages = [...prev];
+                                  const msgIndex = updatedMessages.findIndex(m => m.id === message.id);
+                                  if (msgIndex >= 0) {
+                                    updatedMessages[msgIndex] = {
+                                      ...updatedMessages[msgIndex],
+                                      showThinks: !updatedMessages[msgIndex].showThinks
+                                    };
+                                  }
+                                  return updatedMessages;
+                                });
+                              }}
+                              title={message.showThinks ? 'Hide thinking process' : 'Show thinking process'}
+                            >
+                              {message.showThinks ? '▼' : '▶'}
+                            </button>
+                            <div 
+                              className={`message-think ${message.showThinks ? 'open' : ''}`}
+                              ref={(el) => {
+                                // Auto-scroll when thinking is expanded and message is streaming
+                                if (el && message.showThinks && message.isStreaming) {
+                                  el.scrollTop = el.scrollHeight;
+                                }
+                              }}
+                            >
+                              {message.thinks.map((think, index) => (
+                                <div key={index} className="think-item">
+                                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{think}</ReactMarkdown>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        <div className="message-content">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+                          {message.isStreaming && <span className="typing-indicator">...</span>}
+                        </div>
+                        <div className="message-time">
+                          {message.createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </div>
+                      </div>
+                    ))}
+                    {isTyping && (
+                      <div className="message assistant typing">
+                        <div className="message-content">
+                          <div className="typing-dots">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                          </div>
+                        </div>
                       </div>
                     )}
-                    <div className="message-content">
-                      {message.role === 'assistant' ? (
-                        <ReactMarkdown>{message.content}</ReactMarkdown>
-                      ) : (
-                        message.content
-                      )}
-                      {message.isStreaming && <span className="typing-indicator">...</span>}
-                    </div>
-                    <div className="message-time">
-                      {message.createdAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                    </div>
-                  </div>
-                ))}
-                {isTyping && (
-                  <div className="message assistant typing">
-                    <div className="message-content">
-                      <div className="typing-dots">
-                        <span></span>
-                        <span></span>
-                        <span></span>
-                      </div>
-                    </div>
-                  </div>
+                  </>
                 )}
                 <div ref={messagesEndRef} />
               </div>

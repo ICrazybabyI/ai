@@ -15,7 +15,11 @@ const __dirname = path.dirname(__filename);
 
 dotenv.config();
 
-const httpPort = 80;
+console.log('Loaded environment variables:');
+console.log('PORT:', process.env.PORT);
+
+const httpPort = process.env.PORT || 80;
+console.log('Using HTTP port:', httpPort);
 
 const app = express();
 app.use(cors());
@@ -79,21 +83,33 @@ async function initializeDatabase() {
         title VARCHAR(100) NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        dify_conversation_id VARCHAR(100) NULL,
         FOREIGN KEY (user_id) REFERENCES users(id)
       )
     `);
     
-    // Create messages table if not exists
+    // Create messages table if not exists (matching actual database structure)
     await connection.query(`
       CREATE TABLE IF NOT EXISTS messages (
         id VARCHAR(36) PRIMARY KEY,
+        user VARCHAR(36) NULL,
         conversation_id VARCHAR(36) NOT NULL,
-        role ENUM('user', 'assistant') NOT NULL,
-        content TEXT NOT NULL,
+        query TEXT NOT NULL,
+        answer TEXT NOT NULL,
+        think TEXT NULL,
+        helper VARCHAR(50) DEFAULT 'cisco' NOT NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        ai_update_at TIMESTAMP NULL,
         FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
       )
     `);
+    
+    // Add helper column if it doesn't exist (for existing tables)
+    try {
+      await connection.query(`ALTER TABLE messages ADD COLUMN IF NOT EXISTS helper VARCHAR(50) DEFAULT 'cisco' NOT NULL`);
+    } catch (error) {
+      console.log('Helper column already exists, skipping:', error.message);
+    }
     
     connection.release();
     databaseAvailable = true;
@@ -149,8 +165,8 @@ async function mockAIResponse(ws, conversationId, message) {
   // Save full response to database
   if (databaseAvailable && pool) {
     await pool.query(
-      'INSERT INTO messages (id, conversation_id, role, content) VALUES (?, ?, ?, ?)',
-      [assistantMessageId, conversationId, 'assistant', responseText]
+      'INSERT INTO messages (id, conversation_id, query, answer, helper) VALUES (?, ?, ?, ?, ?)',
+      [assistantMessageId, conversationId, '', responseText, helper || 'cisco']
     );
   }
 }
@@ -172,8 +188,8 @@ async function handleNewMessage(ws, data) {
   const userMessageId = uuidv4();
   if (databaseAvailable && pool) {
     await pool.query(
-      'INSERT INTO messages (id, conversation_id, role, content) VALUES (?, ?, ?, ?)',
-      [userMessageId, conversation.id, 'user', message]
+      'INSERT INTO messages (id, user, conversation_id, query, answer, helper) VALUES (?, ?, ?, ?, ?, ?)',
+      [userMessageId, user.id, conversation.id, message, '', data.helper || 'cisco']
     );
   }
   
@@ -184,11 +200,12 @@ async function handleNewMessage(ws, data) {
     conversationId: conversation.id,
     role: 'user',
     content: message,
+    helper: data.helper || 'cisco',
     createdAt: new Date().toISOString()
   }));
   
   // Call Dify API for AI response
-  await callDifyAPI(ws, conversation.id, message);
+  await callDifyAPI(ws, conversation.id, message, userMessageId, data.helper);
   
   // If conversation was just created (i.e., if original conversationId was empty), send conversation_id to client
   if (!data.conversationId || data.conversationId === '') {
@@ -199,17 +216,18 @@ async function handleNewMessage(ws, data) {
   }
 }
 
-// Function to process AI response, remove duplicates and extract think sections
+// Function to process AI response, extract think sections and clean content
 function processAIResponse(response) {
   // Initialize variables
   const thinks = [];
   let mainContent = response;
   const uniqueThinks = new Set();
   
-  // First handle complete <think> tags with proper closing
+  // Extract all complete <think> sections with proper closing tags
   const completeThinkPattern = /<think>([\s\S]*?)<\/think>/g;
   let match;
   
+  // First extract all complete think sections
   while ((match = completeThinkPattern.exec(response)) !== null) {
     const thinkContent = match[1].trim();
     if (thinkContent && !uniqueThinks.has(thinkContent)) {
@@ -218,106 +236,46 @@ function processAIResponse(response) {
     }
   }
   
-  // Remove all complete think tags from main content
+  // Remove all complete think sections from main content
   mainContent = mainContent.replace(completeThinkPattern, '').trim();
   
-  // Now handle incomplete think tags (missing closing tag)
+  // Handle incomplete think sections (without closing tag) during streaming
+  // These will be properly processed when the complete tag is received
   const incompleteThinkPattern = /<think>([\s\S]*)$/;
   const incompleteMatch = mainContent.match(incompleteThinkPattern);
   
   if (incompleteMatch) {
+    // If there's an incomplete think section at the end, extract it as a think
     const thinkContent = incompleteMatch[1].trim();
     if (thinkContent && !uniqueThinks.has(thinkContent)) {
       uniqueThinks.add(thinkContent);
       thinks.push(thinkContent);
     }
-    // Remove incomplete think tag from main content
+    // Remove the incomplete think section from main content
     mainContent = mainContent.replace(incompleteThinkPattern, '').trim();
   }
   
-  // Handle any remaining partial think tags
-  mainContent = mainContent.replace(/<think>/g, '').trim();
-  mainContent = mainContent.replace(/<\/think>/g, '').trim();
-  
-  // Handle think content that might be in the middle of text
-  const midTextThinkPattern = /<think>([^<]*)/g;
-  while ((match = midTextThinkPattern.exec(mainContent)) !== null) {
-    const thinkContent = match[1].trim();
-    if (thinkContent && !uniqueThinks.has(thinkContent)) {
-      uniqueThinks.add(thinkContent);
-      thinks.push(thinkContent);
-    }
-    mainContent = mainContent.replace(midTextThinkPattern, '').trim();
-  }
-  
-  // Remove duplicate content from the main message
-  const finalContent = removeDuplicates(mainContent);
+  // Clean up any remaining standalone think tags
+  mainContent = mainContent.replace(/<think>/g, '').replace(/<\/think>/g, '').trim();
   
   return {
     thinks,
-    mainContent: finalContent
+    mainContent
   };
 }
 
-// Function to remove duplicate content from AI response
-function removeDuplicates(response) {
-  // Remove duplicate think sections first
-  const thinkPattern = /(<think>([\s\S]*?)<\/think>)/g;
-  const thinkMatches = [];
-  let thinkMatch;
-  
-  // Extract all think sections
-  while ((thinkMatch = thinkPattern.exec(response)) !== null) {
-    thinkMatches.push(thinkMatch[1]);
-  }
-  
-  // Remove duplicate think sections
-  let cleanResponse = response;
-  if (thinkMatches.length > 1) {
-    // Keep only the first think section
-    cleanResponse = cleanResponse.replace(thinkPattern, thinkMatches[0]);
-  }
-  
-  // Find all occurrences of the main response pattern
-  const mainPattern = /你好！我是网络工程师，很高兴能帮助你学习网络相关知识。([\s\S]*?)😊/g;
-  const mainMatches = [];
-  let mainMatch;
-  
-  while ((mainMatch = mainPattern.exec(cleanResponse)) !== null) {
-    mainMatches.push(mainMatch[0]);
-  }
-  
-  if (mainMatches.length > 0) {
-    // Return only the first occurrence along with any preceding content
-    const firstMatchIndex = cleanResponse.indexOf(mainMatches[0]);
-    return cleanResponse.slice(0, firstMatchIndex + mainMatches[0].length);
-  }
-  
-  // Fallback: remove any exact duplicate content using a more general approach
-  const lines = cleanResponse.split('\n');
-  const uniqueLines = [];
-  const seen = new Set();
-  
-  for (const line of lines) {
-    const trimmedLine = line.trim();
-    if (trimmedLine && !seen.has(trimmedLine)) {
-      seen.add(trimmedLine);
-      uniqueLines.push(line);
-    }
-  }
-  
-  return uniqueLines.join('\n');
-}
-
 // Call Dify API for streaming response
-async function callDifyAPI(ws, conversationId, message) {
+async function callDifyAPI(ws, conversationId, message, userMessageId, helper) {
   try {
     const assistantMessageId = uuidv4();
     let fullResponse = '';
     
     // Try different Dify API endpoints
     const difyUrl = process.env.DIFY_API_URL;
-    const apiKey = process.env.DIFY_API_KEY;
+    // Get API key based on helper type
+    const apiKey = helper === 'network' ? 
+      process.env.DIFY_API_KEY_NETWORK || process.env.DIFY_API_KEY : 
+      process.env.DIFY_API_KEY;
     
     // Ensure conversation_id is never null or undefined when calling Dify API
     // If conversationId is null/undefined, generate a new UUID
@@ -474,45 +432,25 @@ async function callDifyAPI(ws, conversationId, message) {
                 case 'message':
                   // Standard message event with answer
                   if (data.answer) {
-                    fullResponse += data.answer;
-                    console.log(`Received answer chunk: ${data.answer}, current fullResponse: ${fullResponse}`);
+                    fullResponse += data.answer; // Accumulate the answer for streaming
+                  }
+                  break;
+                  
+                case 'text':
+                  // Text event with streaming content (common in many streaming APIs)
+                  if (data.text) {
+                    fullResponse += data.text; // Accumulate the text for streaming
                   }
                   break;
                   
                 case 'node_finished':
                   // Check if this node contains answer in its outputs
                   if (data.data && data.data.outputs) {
-                    console.log(`Node outputs: ${JSON.stringify(data.data.outputs)}`);
-                    
                     // Check for answer in different output locations
-                    let answerFound = false;
                     if (data.data.outputs.answer) {
-                      fullResponse += data.data.outputs.answer;
-                      answerFound = true;
+                      fullResponse = data.data.outputs.answer; // For complete answer events, use the full answer
                     } else if (data.data.outputs.sys && data.data.outputs.sys.answer) {
-                      fullResponse += data.data.outputs.sys.answer;
-                      answerFound = true;
-                    } else if (data.data.outputs['sys.query'] && data.data.outputs['sys.query'] !== message) {
-                      fullResponse += data.data.outputs['sys.query'];
-                      answerFound = true;
-                    } else {
-                      // Try to find any text field that might contain the answer
-                      for (const [key, value] of Object.entries(data.data.outputs)) {
-                        if (typeof value === 'string' && value.length > 0) {
-                          fullResponse += value;
-                          answerFound = true;
-                          break;
-                        } else if (typeof value === 'object' && value !== null) {
-                          for (const [subKey, subValue] of Object.entries(value)) {
-                            if (typeof subValue === 'string' && subValue.length > 0) {
-                              fullResponse += subValue;
-                              answerFound = true;
-                              break;
-                            }
-                          }
-                        }
-                        if (answerFound) break;
-                      }
+                      fullResponse = data.data.outputs.sys.answer; // For complete answer events, use the full answer
                     }
                   }
                   break;
@@ -576,13 +514,13 @@ async function callDifyAPI(ws, conversationId, message) {
           createdAt: new Date().toISOString()
         }));
         
-        // Save processed main content to database
+        // Save processed main content to database by updating the user message record
         if (databaseAvailable && pool) {
           await pool.query(
-            'INSERT INTO messages (id, conversation_id, role, content) VALUES (?, ?, ?, ?)',
-            [assistantMessageId, conversationId, 'assistant', processed.mainContent]
+            'UPDATE messages SET answer = ?, think = ?, ai_update_at = NOW() WHERE id = ?',
+            [processed.mainContent, JSON.stringify(processed.thinks), userMessageId]
           );
-          console.log('Saved full response to database');
+          console.log('Updated user message record with AI response');
         }
       } else if (isStreaming && fullResponse) {
         // If we're still streaming after reading all chunks, send final message
@@ -602,13 +540,13 @@ async function callDifyAPI(ws, conversationId, message) {
           createdAt: new Date().toISOString()
         }));
         
-        // Save processed main content to database
+        // Save processed main content to database by updating the user message record
         if (databaseAvailable && pool) {
           await pool.query(
-            'INSERT INTO messages (id, conversation_id, role, content) VALUES (?, ?, ?, ?)',
-            [assistantMessageId, conversationId, 'assistant', processed.mainContent]
+            'UPDATE messages SET answer = ?, think = ?, ai_update_at = NOW() WHERE id = ?',
+            [processed.mainContent, JSON.stringify(processed.thinks), userMessageId]
           );
-          console.log('Saved full response to database');
+          console.log('Updated user message record with AI response');
         }
       }
       
@@ -663,10 +601,60 @@ async function handleGetMessages(ws, data) {
       [conversationId]
     );
     
+    // Convert database messages to frontend expected format
+    // Each database record contains both user query and AI answer, so we need to create two messages per record
+    const formattedMessages = [];
+    
+    messages.forEach(dbMsg => {
+        // Add user message if query exists
+        if (dbMsg.query) {
+          formattedMessages.push({
+            id: dbMsg.id,
+            conversationId: dbMsg.conversation_id,
+            role: 'user',
+            content: dbMsg.query,
+            helper: dbMsg.helper,
+            thinks: [],
+            isStreaming: false,
+            createdAt: new Date(dbMsg.created_at).toISOString(),
+            showThinks: false
+          });
+        }
+        
+        // Add assistant message if answer exists
+        if (dbMsg.answer) {
+          let thinks = [];
+          // Parse thinks from JSON string if exists
+          if (dbMsg.think) {
+            try {
+              thinks = JSON.parse(dbMsg.think);
+              if (!Array.isArray(thinks)) {
+                thinks = [thinks];
+              }
+            } catch (e) {
+              console.error('Error parsing thinks:', e);
+              thinks = [];
+            }
+          }
+          
+          formattedMessages.push({
+            id: dbMsg.id + '_assistant', // Create unique ID for assistant message
+            conversationId: dbMsg.conversation_id,
+            role: 'assistant',
+            content: dbMsg.answer,
+            helper: dbMsg.helper,
+            thinks: thinks,
+            isStreaming: false,
+            createdAt: new Date(dbMsg.ai_update_at || dbMsg.created_at).toISOString(),
+            showThinks: false
+          });
+        }
+      });
+    
     ws.send(JSON.stringify({
       type: 'messages',
       conversationId: conversationId,
-      messages: messages
+      messages: formattedMessages
     }));
   }
 }
@@ -702,6 +690,66 @@ async function handleCreateConversation(ws, data) {
       type: 'conversation_created',
       conversationId: conversationId
     }));
+  }
+}
+
+async function handleDeleteConversation(ws, data) {
+  let { conversationId, userId } = data;
+  
+  console.log('DEBUG: handleDeleteConversation called with:', {
+    conversationId,
+    userId,
+    databaseAvailable,
+    hasPool: !!pool
+  });
+  
+  // Generate a valid userId if none provided
+  userId = userId || uuidv4();
+  
+  // Create user if not exists
+  let user = await createUserIfNotExists(userId);
+  
+  if (databaseAvailable && pool) {
+    console.log('DEBUG: Database available, proceeding with deletion');
+    
+    // First, delete all messages associated with the conversation
+    console.log('DEBUG: Deleting messages for conversation:', conversationId);
+    const [deleteMessagesResult] = await pool.query(
+      'DELETE FROM messages WHERE conversation_id = ?',
+      [conversationId]
+    );
+    console.log('DEBUG: Messages deleted result:', deleteMessagesResult);
+    
+    // Then delete the conversation itself
+    console.log('DEBUG: Deleting conversation:', conversationId, 'for user:', user.id);
+    const [deleteConversationResult] = await pool.query(
+      'DELETE FROM conversations WHERE id = ? AND user_id = ?',
+      [conversationId, user.id]
+    );
+    console.log('DEBUG: Conversation deleted result:', deleteConversationResult);
+    
+    // Check if conversation was actually deleted
+    if (deleteConversationResult.affectedRows === 0) {
+      console.log('DEBUG: No conversation found with id:', conversationId, 'for user:', user.id);
+    }
+    
+    // Send updated conversations list
+    console.log('DEBUG: Getting updated conversations for user:', user.id);
+    const [conversations] = await pool.query(
+      'SELECT * FROM conversations WHERE user_id = ? ORDER BY updated_at DESC',
+      [user.id]
+    );
+    console.log('DEBUG: Updated conversations count:', conversations.length);
+    console.log('DEBUG: Updated conversations:', conversations.map(c => c.id));
+    
+    const response = JSON.stringify({
+      type: 'conversations',
+      conversations: conversations
+    });
+    console.log('DEBUG: Sending conversations response:', response.length, 'characters');
+    ws.send(response);
+  } else {
+    console.log('DEBUG: Database not available, skipping deletion');
   }
 }
 
@@ -817,6 +865,10 @@ wss.on('connection', (ws, req) => {
         case 'create_conversation':
           console.log('Handling create_conversation:', data);
           await handleCreateConversation(ws, data);
+          break;
+        case 'delete_conversation':
+          console.log('Handling delete_conversation:', data);
+          await handleDeleteConversation(ws, data);
           break;
         default:
           console.log('Unknown message type:', data.type);
